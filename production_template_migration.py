@@ -9,6 +9,8 @@ from datetime import datetime
 from datetime import timedelta
 import pandas as pd
 import plotly.express as px
+import tempfile
+import io
 
 # Load .env if present
 load_dotenv()
@@ -74,10 +76,12 @@ def jira_login_page():
     col1, col2, col3 = st.columns([1, 2, 1])
 
     with col2:
-        st.markdown("<div class='login-box'>", unsafe_allow_html=True)
-
-        st.markdown("<div class='login-title'>🔗 Jira Service Account Login</div>", unsafe_allow_html=True)
-        st.markdown("<div class='login-sub'>Entrez les informations de votre compte de service Atlassian</div>", unsafe_allow_html=True)
+        colo1, colo2, colo3 = st.columns([1, 2, 1])
+        with colo2 :
+            st.image("assets/Nacon_Logo_White.png", width=180)
+        
+        st.markdown("<div class='login-title'>Jira Template Migration</div>", unsafe_allow_html=True)
+        st.markdown("<div class='login-sub'>Enter your Atlassian connection information</div>", unsafe_allow_html=True)
 
         # Default env vars (for local dev or Streamlit Cloud)
         default_url = os.getenv("JIRA_URL", "")
@@ -85,8 +89,8 @@ def jira_login_page():
         default_token = os.getenv("JIRA_API_TOKEN", "")
 
         # Input Fields
-        jira_url = st.text_input("🔗 Jira URL", value=default_url, placeholder="https://yourinstance.atlassian.net")
-        username = st.text_input("📧 Service Account Email", value=default_email)
+        jira_url = st.text_input("🔗 Jira Instance URL", value=default_url, placeholder="https://yourinstance.atlassian.net")
+        username = st.text_input("📧 Account Email", value=default_email)
         token = st.text_input("🔑 API Token", value=default_token, type="password")
 
         cloud_mode = True  # Always Cloud for service accounts
@@ -167,7 +171,7 @@ def get_jql_template_epic(base_url: str, auth: HTTPBasicAuth, maxResults=50):
         "jql": jql,
         "startAt": 0,
         "maxResults": 50,
-        "fields": "summary,description,status,assignee,customfield_10015"
+        "fields": "summary,description,status,assignee,customfield_10015,attachment"
     }
 
     url = f"{base_url}/rest/api/3/search/jql"
@@ -193,7 +197,7 @@ def get_child_issues_for_epic(base_url: str, auth: HTTPBasicAuth, epic_key: str,
     params = {
         "jql": jql,
         "maxResults": maxResults,
-        "fields": "summary,status,assignee,reporter,description,customfield_10015,duedate,issuelinks,issuetype"
+        "fields": "summary,status,assignee,reporter,description,customfield_10015,duedate,issuelinks,issuetype,attachment"
     }
     url = f"{base_url}/rest/api/3/search/jql"
     resp = requests.get(url, headers={"Accept": "application/json"}, auth=auth, params=params)
@@ -275,6 +279,35 @@ def to_datetime_safe(value):
         print(f"Impossible de convertir '{value}' ({type(value)}): {e}")
         return None
 
+def download_attachment(url, auth):
+    resp = requests.get(url, auth=auth)
+    if resp.status_code == 200:
+        return resp.content
+    else:
+        raise Exception(f"Attachment download failed: {resp.status_code}")
+
+
+def migrate_attachment_epic(jira_client, auth, attachment, issue_key, project_suffix=""):
+    """Migre un attachment Epic (objet Attachment Jira)"""
+    filename = f"{project_suffix} - {attachment.filename}" if project_suffix else attachment.filename
+    resp = requests.get(attachment.content, auth=auth, timeout=30)
+    if resp.status_code >= 400:
+        raise Exception(f"Erreur téléchargement fichier {filename}: {resp.status_code}")
+    file_data = io.BytesIO(resp.content)
+    jira_client.add_attachment(issue=issue_key, filename=filename, attachment=file_data)
+
+def migrate_attachment_child(jira_client, auth, attachment_dict, issue_key, project_suffix=""):
+    attachments = fields.get("attachment", [])
+    for att in attachments:
+        if isinstance(att, dict):  # REST API
+            filename = f"{selected_label} - {att['filename']}"
+            file_content = requests.get(att['content'], auth=HTTPBasicAuth(st.session_state.username, st.session_state.token)).content
+        else:  # objet Attachment (Epic)
+            filename = f"{selected_label} - {att.filename}"
+            file_content = att.content
+
+        file_data = io.BytesIO(file_content)
+        jira.add_attachment(issue=new_issue.key, filename=filename, attachment=file_data)
 
 # -------------------
 # Streamlit UI
@@ -339,7 +372,7 @@ if st.session_state.connected and st.session_state.jira_client:
     projects_map = {p.key: p for p in filtered_projects}
     project_keys = list(projects_map.keys())
 
-    project_labels = {f"{p.key} – {p.name}": p.key for p in filtered_projects}
+    project_labels = {f"{p.name}": p.key for p in filtered_projects}
 
     if not project_keys:
         st.info("Aucun projet trouvé ou pas accès.")
@@ -553,6 +586,15 @@ if st.button("Migrate Template"):
     try:
         st.write("📌 Migration under process...")
 
+        child_issues = get_child_issues_for_epic(base_url, auth, selected_epic, maxResults=200)     
+        child_links_map  = {}
+        old_to_new_keys = {}
+
+        total_steps = len(child_issues) + 1  # +1 pour l'EPIC
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        current_step = 0
+
         # Récupération de l’EPIC d’origine
         epic_issue = jira.issue(selected_epic)
         epic_fields = epic_issue.fields
@@ -586,7 +628,20 @@ if st.button("Migrate Template"):
         }
 
         new_epic = jira.create_issue(fields=new_epic_data)
+
+        epic_attachments = epic_fields.attachment
+
+        for att in epic_attachments:
+            file_data = download_attachment(
+                att.content,
+                auth=HTTPBasicAuth(st.session_state.username, st.session_state.token)
+            )
+            migrate_attachment_epic(jira, auth,att, new_epic.key,project_suffix = selected_label)
+
         st.success(f"New EPIC created : {new_epic.key}")
+
+        current_step += 1
+        progress_bar.progress(current_step / total_steps)
 
 
         
@@ -595,10 +650,6 @@ if st.button("Migrate Template"):
         # 2. Recréer chaque enfant avec delta date
         # ---------------------------------------------------------
         
-
-        child_issues = get_child_issues_for_epic(base_url, auth, selected_epic, maxResults=200)     
-        child_links_map  = {}
-        old_to_new_keys = {}
 
         for ch in child_issues:
             ch_key = ch["key"]
@@ -665,7 +716,7 @@ if st.button("Migrate Template"):
             create_payload = {
                 "project": {"key": selected_key},
                 "summary": fields.get("summary"),
-                "description": fields.get("description"),
+                "description": adf_to_markdown(fields.get("description")),
                 "issuetype": {"id": child_type_id},
                 "customfield_10014": new_epic.key,  # Lien vers l'epic parent
             }
@@ -680,8 +731,21 @@ if st.button("Migrate Template"):
             new_issue = jira.create_issue(fields=create_payload)
 
             old_to_new_keys[ch_key] = new_issue.key
+            
+            attachments = fields.get("attachment", [])
 
-            st.write(f"Task migrated: {new_issue.key}")
+            for att in attachments:
+                file_data = download_attachment(
+                    att["content"],  # URL du fichier
+                    auth=HTTPBasicAuth(st.session_state.username, st.session_state.token)
+                )
+                # Ici on envoie le nom et les données
+                migrate_attachment_child(jira, auth, file_data, new_issue.key,project_suffix = selected_label)
+
+            current_step += 1
+            progress_bar.progress(current_step / total_steps)
+
+        st.success(f"Issues creation complete, migrating dependencies...")
 
         for old_key, links in child_links_map.items():
             new_key = old_to_new_keys.get(old_key)
